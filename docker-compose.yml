@@ -1,0 +1,328 @@
+name: ecommerce-sre-app
+
+services:
+  # ---------------------------------------------------------------------
+  # Infrastructure
+  # ---------------------------------------------------------------------
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./compose/postgres-init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mongo:
+    image: mongo:7
+    volumes:
+      - mongodata:/data/db
+    ports:
+      - "27017:27017"
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping')"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  kafka:
+    image: apache/kafka:3.7.0
+    environment:
+      # Kafka's own default (checked directly inside the running container)
+      # is `advertised.listeners=PLAINTEXT://localhost:9092` — meaning it
+      # tells EVERY client "reconnect to localhost:9092", which only works
+      # for a process on the same machine as the broker. Other containers
+      # (Order, Inventory, Payment, Notification) need a listener advertised
+      # as `kafka:9092` instead. Two listeners solve both cases at once:
+      # PLAINTEXT for other containers, EXTERNAL for anything on the host
+      # machine (native tools, or you debugging from outside Compose).
+      KAFKA_LISTENERS: "PLAINTEXT://:9092,CONTROLLER://:9093,EXTERNAL://:9094"
+      KAFKA_ADVERTISED_LISTENERS: "PLAINTEXT://kafka:9092,EXTERNAL://localhost:9094"
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: "CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,EXTERNAL:PLAINTEXT"
+      KAFKA_INTER_BROKER_LISTENER_NAME: "PLAINTEXT"
+      KAFKA_CONTROLLER_LISTENER_NAMES: "CONTROLLER"
+      # The image auto-fills these three when NO KAFKA_* env vars are set at
+      # all (that's how it ran fine standalone earlier). The moment you
+      # override anything, that auto-fill stops applying — without these,
+      # its startup script falls back to assuming legacy Zookeeper mode and
+      # fails asking for `zookeeper.connect`, which doesn't exist here.
+      KAFKA_NODE_ID: "1"
+      KAFKA_PROCESS_ROLES: "broker,controller"
+      KAFKA_CONTROLLER_QUORUM_VOTERS: "1@localhost:9093"
+      # Kafka's internal __consumer_offsets topic (every consumer group uses
+      # it to track what's already been processed) defaults to needing 3
+      # replicas. With only 1 broker in this Compose setup, that topic can
+      # never be created, and every consumer group (Order, Inventory,
+      # Payment, Notification) gets stuck forever retrying "Group
+      # Coordinator Not Available" — found by actually placing an order and
+      # watching it never leave `pending`, not by reading the config. A
+      # real multi-broker cluster wouldn't need this override.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: "1"
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: "1"
+    ports:
+      - "9094:9094"
+    healthcheck:
+      # Runs INSIDE the kafka container itself, so localhost:9092 here is
+      # correct and unrelated to the advertised-listener issue above.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092"]
+      interval: 5s
+      timeout: 5s
+      retries: 15
+      start_period: 15s
+
+  # ---------------------------------------------------------------------
+  # Backend services
+  # ---------------------------------------------------------------------
+
+  auth:
+    image: bigstan00/ecommerce-auth:latest
+    environment:
+      PORT: "4001"
+      DATABASE_URL: postgres://auth:auth@postgres:5432/auth
+      JWT_SECRET: ${JWT_SECRET}
+      ACCESS_TOKEN_TTL: 15m
+      REFRESH_TOKEN_TTL: 7d
+    ports:
+      - "4001:4001"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Auth's HEALTHCHECK is already baked into its own Dockerfile, so no
+    # healthcheck: block is needed here — Compose uses the image's own.
+
+  catalog:
+    image: bigstan00/ecommerce-catalog:latest
+    environment:
+      PORT: "4002"
+      MONGO_URI: mongodb://mongo:27017
+      MONGO_DB_NAME: catalog
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+    ports:
+      - "4002:4002"
+    depends_on:
+      mongo:
+        condition: service_healthy
+    # Catalog's Dockerfile has no HEALTHCHECK, so Compose has nothing to
+    # check depends_on's "healthy" condition against unless we define one
+    # here. Its Alpine base doesn't have curl, but does ship wget (part of
+    # BusyBox) — confirmed by actually running the built image, not assumed.
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:4002/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  cart:
+    image: bigstan00/ecommerce-cart:latest
+    environment:
+      PORT: "4003"
+      REDIS_URL: redis://redis:6379
+      CATALOG_SERVICE_URL: http://catalog:4002
+    ports:
+      - "4003:4003"
+    depends_on:
+      redis:
+        condition: service_healthy
+      catalog:
+        condition: service_healthy
+    # Node image, so Node itself (already present) can make the check —
+    # same self-contained pattern Auth's own Dockerfile HEALTHCHECK uses.
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:4003/healthz', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  order:
+    image: bigstan00/ecommerce-order:latest
+    environment:
+      PORT: "4004"
+      DATABASE_URL: postgres://postgres:postgres@postgres:5432/order?sslmode=disable
+      KAFKA_BROKERS: kafka:9092
+      CART_SERVICE_URL: http://cart:4003
+      # Needed for GET /admin/orders (added in Phase 5) — missed on the
+      # first pass of this file, caught when the container actually failed
+      # to start rather than assumed to be correct.
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+    ports:
+      - "4004:4004"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      cart:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:4004/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  inventory:
+    image: bigstan00/ecommerce-inventory:latest
+    environment:
+      PORT: "4006"
+      DATABASE_URL: postgres://inventory:inventory@postgres:5432/inventory
+      KAFKA_BROKERS: kafka:9092
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+      CATALOG_SERVICE_URL: http://catalog:4002
+    ports:
+      - "4006:4006"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:4006/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  payment:
+    image: bigstan00/ecommerce-payment:latest
+    environment:
+      PORT: "4005"
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/payment
+      KAFKA_BROKERS: kafka:9092
+      PAYMENT_FAILURE_RATE: "0.1"
+      PAYMENT_LATENCY_MS_MIN: "200"
+      PAYMENT_LATENCY_MS_MAX: "1500"
+    ports:
+      - "4005:4005"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    # This image only has python3 available (no curl/wget — confirmed by
+    # checking the actual built image), so the check uses Python's own
+    # standard library instead of an external tool.
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import urllib.request,sys\ntry:\n  sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4005/healthz', timeout=2).status==200 else 1)\nexcept Exception:\n  sys.exit(1)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  notification:
+    image: bigstan00/ecommerce-notification:latest
+    environment:
+      PORT: "4007"
+      KAFKA_BROKERS: kafka:9092
+    ports:
+      - "4007:4007"
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - "CMD"
+        - "python3"
+        - "-c"
+        - "import urllib.request,sys\ntry:\n  sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:4007/healthz', timeout=2).status==200 else 1)\nexcept Exception:\n  sys.exit(1)"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # Gateway and frontends
+  # ---------------------------------------------------------------------
+
+  gateway:
+    image: bigstan00/ecommerce-gateway:latest
+    environment:
+      PORT: "8080"
+      AUTH_SERVICE_URL: http://auth:4001
+      CATALOG_SERVICE_URL: http://catalog:4002
+      CART_SERVICE_URL: http://cart:4003
+      ORDER_SERVICE_URL: http://order:4004
+      INVENTORY_SERVICE_URL: http://inventory:4006
+      JWT_SECRET: ${JWT_SECRET}
+    ports:
+      - "8080:8080"
+    depends_on:
+      auth:
+        condition: service_healthy
+      catalog:
+        condition: service_healthy
+      cart:
+        condition: service_healthy
+      order:
+        condition: service_healthy
+    # Gateway's HEALTHCHECK is already baked into its own Dockerfile.
+
+  frontend:
+    image: bigstan00/ecommerce-storefront:latest
+    # No NEXT_PUBLIC_API_URL here on purpose — it's a BUILD-time value for
+    # Next.js, not a runtime one, so setting it here would have zero effect.
+    # It's already baked into this image as http://gateway:8080/api (see
+    # the rebuild step that used --build-arg NEXT_PUBLIC_API_URL=...).
+    ports:
+      - "3000:3000"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3000/healthz', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  admin:
+    image: bigstan00/ecommerce-admin:latest
+    ports:
+      - "3001:3001"
+    depends_on:
+      gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://127.0.0.1:3001/healthz', r => process.exit(r.statusCode===200?0:1)).on('error', () => process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # ---------------------------------------------------------------------
+  # One-off jobs — NOT started by a plain `docker compose up`.
+  # Run explicitly with `docker compose --profile seed run --rm <name>`.
+  # ---------------------------------------------------------------------
+
+  inventory-seed:
+    image: bigstan00/ecommerce-inventory:latest
+    entrypoint: ["/app/inventory-seed"]
+    environment:
+      DATABASE_URL: postgres://inventory:inventory@postgres:5432/inventory
+      CATALOG_SERVICE_URL: http://catalog:4002
+      # Same config loader as the main server requires this even though the
+      # seed binary itself never reads it — same gap as Order had earlier.
+      ADMIN_TOKEN: ${ADMIN_TOKEN}
+    depends_on:
+      catalog:
+        condition: service_healthy
+    profiles: ["seed"]
+
+volumes:
+  pgdata:
+  mongodata:
