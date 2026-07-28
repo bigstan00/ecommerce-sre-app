@@ -1,4 +1,5 @@
 import './tracing';
+// CI/CD pipeline test — harmless comment, no functional change.
 import { buildApp } from './app';
 import { config } from './config';
 import { logger } from './config/logger';
