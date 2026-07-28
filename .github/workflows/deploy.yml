@@ -1,0 +1,128 @@
+# Builds and deploys only the services that actually changed, on every
+# push to master. Runs on our OWN self-hosted runner (a pod inside the
+# cluster — see infra/k8s/ci-runner.yaml) specifically so this never
+# needs the cluster's API server exposed to the public internet: the
+# runner reaches it over the cluster's internal network, using its own
+# scoped ServiceAccount identity (infra/k8s/ci-rbac.yaml) — never the
+# cluster-admin kubeconfig used for manual commands throughout this
+# project.
+#
+# Note: there's exactly one runner replica right now, so if a single
+# push changes multiple services, their build+deploy jobs queue and run
+# one at a time rather than in parallel — fine for a learning cluster,
+# worth knowing about if it ever feels slow.
+
+name: Build and Deploy
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - "services/**"
+      - "gateway/**"
+      - "frontend/**"
+      - "admin/**"
+      - "shared/**"
+
+jobs:
+  detect-changes:
+    runs-on: [self-hosted, k8s-learning]
+    outputs:
+      services: ${{ steps.filter.outputs.changes }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            auth: 'services/auth/**'
+            cart: 'services/cart/**'
+            catalog: 'services/catalog/**'
+            inventory: 'services/inventory/**'
+            notification: 'services/notification/**'
+            order: 'services/order/**'
+            payment: 'services/payment/**'
+            gateway: 'gateway/**'
+            frontend: 'frontend/**'
+            admin: 'admin/**'
+
+  build-and-deploy:
+    needs: detect-changes
+    if: needs.detect-changes.outputs.services != '[]'
+    runs-on: [self-hosted, k8s-learning]
+    strategy:
+      matrix:
+        service: ${{ fromJSON(needs.detect-changes.outputs.services) }}
+      fail-fast: false
+    steps:
+      - uses: actions/checkout@v4
+
+      # Maps each matrix service name to its build context (folder) and
+      # Docker Hub image name — the two aren't always identical (the
+      # frontend's folder is `frontend`, but its image is
+      # `ecommerce-storefront`, matching the name already live on
+      # Docker Hub from when it was first built by hand).
+      - name: Set build variables
+        id: vars
+        run: |
+          case "${{ matrix.service }}" in
+            auth) echo "context=services/auth" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-auth" >> "$GITHUB_OUTPUT" ;;
+            cart) echo "context=services/cart" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-cart" >> "$GITHUB_OUTPUT" ;;
+            catalog) echo "context=services/catalog" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-catalog" >> "$GITHUB_OUTPUT" ;;
+            inventory) echo "context=services/inventory" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-inventory" >> "$GITHUB_OUTPUT" ;;
+            notification) echo "context=services/notification" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-notification" >> "$GITHUB_OUTPUT" ;;
+            order) echo "context=services/order" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-order" >> "$GITHUB_OUTPUT" ;;
+            payment) echo "context=services/payment" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-payment" >> "$GITHUB_OUTPUT" ;;
+            gateway) echo "context=gateway" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-gateway" >> "$GITHUB_OUTPUT" ;;
+            frontend) echo "context=frontend" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-storefront" >> "$GITHUB_OUTPUT" ;;
+            admin) echo "context=admin" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-admin" >> "$GITHUB_OUTPUT" ;;
+          esac
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Frontend/Admin need the Gateway's real external URL compiled
+      # into the browser bundle at build time (Next.js inlines
+      # NEXT_PUBLIC_* vars) — same requirement discovered the hard way
+      # in Phase 9. Every other service gets no extra build args.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ steps.vars.outputs.context }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            ${{ (matrix.service == 'frontend' || matrix.service == 'admin') && 'NEXT_PUBLIC_API_URL=http://13.63.120.61:30080/api' || '' }}
+          tags: |
+            ${{ steps.vars.outputs.image }}:${{ github.sha }}
+            ${{ steps.vars.outputs.image }}:latest
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v4
+
+      # Builds a kubeconfig from the runner pod's own mounted
+      # ServiceAccount token/CA cert — the scoped `ci-deployer` identity
+      # (infra/k8s/ci-rbac.yaml), not a copy of the cluster-admin
+      # kubeconfig. Nothing sensitive ever leaves the cluster: this
+      # credential is a Kubernetes-native token, generated fresh, valid
+      # only inside this cluster.
+      - name: Configure in-cluster kubeconfig
+        run: |
+          kubectl config set-cluster in-cluster --server=https://kubernetes.default.svc --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          kubectl config set-credentials ci-deployer --token="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+          kubectl config set-context in-cluster --cluster=in-cluster --user=ci-deployer
+          kubectl config use-context in-cluster
+
+      - name: Deploy
+        run: |
+          kubectl set image deployment/${{ matrix.service }} ${{ matrix.service }}=${{ steps.vars.outputs.image }}:${{ github.sha }} -n ecommerce
+          kubectl rollout status deployment/${{ matrix.service }} -n ecommerce --timeout=180s

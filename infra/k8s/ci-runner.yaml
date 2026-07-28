@@ -1,0 +1,75 @@
+# The self-hosted GitHub Actions runner, living as a pod inside the
+# cluster instead of on GitHub's own infrastructure. Two containers
+# sharing one pod (and therefore one network namespace, so they reach
+# each other over `localhost`):
+#
+#   1. `runner` — GitHub's runner software. On startup it exchanges the
+#      PAT we stored in the `github-pat` Secret for a short-lived
+#      registration token and registers itself with the repo
+#      automatically (this is what myoung34/github-runner's entrypoint
+#      does — the raw upstream runner image expects you to fetch that
+#      short-lived token yourself, which doesn't survive a pod
+#      restart; this image re-derives it every time it starts, which
+#      is what makes it usable as a long-running Deployment).
+#
+#   2. `dind` — a nested Docker daemon, used only for `docker buildx`
+#      multi-arch builds. Necessary because this cluster's actual nodes
+#      run containerd, not Docker — there's no host Docker socket to
+#      reuse, so CI needs its own throwaway one. Runs `--privileged`,
+#      which is a real trade-off: a privileged container has a larger
+#      potential blast radius than an unprivileged one. Accepted here
+#      as a well-established, common pattern for exactly this use case;
+#      the more locked-down alternative (Kaniko or rootless
+#      buildkit — no privileged container at all) is a real hardening
+#      step for later, not implemented here for speed.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: ci-runner
+  namespace: ci
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: ci-runner
+  template:
+    metadata:
+      labels:
+        app: ci-runner
+    spec:
+      serviceAccountName: ci-deployer
+      containers:
+        - name: runner
+          image: myoung34/github-runner:latest
+          env:
+            - { name: RUNNER_SCOPE, value: "repo" }
+            - { name: REPO_URL, value: "https://github.com/bigstan00/ecommerce-sre-app" }
+            - { name: RUNNER_NAME, value: "k8s-ci-runner" }
+            # Custom label so the workflow YAML can target this exact
+            # runner via `runs-on: [self-hosted, k8s-learning]` rather
+            # than the bare `self-hosted` tag, which would also match
+            # any other self-hosted runner registered to the repo.
+            - { name: LABELS, value: "self-hosted,k8s-learning" }
+            - { name: RUNNER_WORKDIR, value: "/tmp/runner" }
+            # Points docker builds at the sidecar below, over the pod's
+            # shared loopback interface.
+            - { name: DOCKER_HOST, value: "tcp://localhost:2375" }
+            - name: ACCESS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: github-pat
+                  key: PAT
+        - name: dind
+          image: docker:24-dind
+          securityContext:
+            privileged: true
+          env:
+            # Disables TLS between the runner and this sidecar — both
+            # containers are in the same pod, never leave it, so
+            # there's no network to eavesdrop on. Simpler than
+            # generating/mounting certs for a connection that never
+            # crosses a pod boundary.
+            - { name: DOCKER_TLS_CERTDIR, value: "" }
+          args:
+            - "--host=tcp://0.0.0.0:2375"
+            - "--host=unix:///var/run/docker.sock"
