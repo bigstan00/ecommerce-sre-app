@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: frontend
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: frontend
+  template:
+    metadata:
+      labels:
+        app: frontend
+    spec:
+      containers:
+        - name: frontend
+          image: bigstan00/ecommerce-storefront:latest
+          ports:
+            - containerPort: 3000
+          # NEXT_PUBLIC_API_URL is NOT set here on purpose — it was compiled
+          # directly into the JS bundle at `docker build` time (Next.js
+          # inlines NEXT_PUBLIC_* vars), so setting it as a runtime env var
+          # here would have zero effect. If the Gateway's external address
+          # ever changes, the image must be rebuilt, not just redeployed.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: frontend
+  namespace: ecommerce
+spec:
+  type: NodePort
+  selector:
+    app: frontend
+  ports:
+    - port: 3000
+      targetPort: 3000
+      nodePort: 30090

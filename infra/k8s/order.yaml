@@ -1,0 +1,43 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: order
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: order
+  template:
+    metadata:
+      labels:
+        app: order
+    spec:
+      containers:
+        - name: order
+          image: bigstan00/ecommerce-order:latest
+          ports:
+            - containerPort: 4004
+          envFrom:
+            - secretRef:
+                name: order-db-url        # provides DATABASE_URL
+            - secretRef:
+                name: app-shared-secrets  # provides ADMIN_TOKEN (and JWT_SECRET, unused here — harmless)
+          env:
+            - { name: PORT, value: "4004" }
+            - { name: KAFKA_BROKERS, value: "kafka:9092" }
+            - { name: CART_SERVICE_URL, value: "http://cart:4003" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://localhost:4318" }
+            - { name: OTEL_SERVICE_NAME, value: "order-service" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: order
+  namespace: ecommerce
+spec:
+  selector:
+    app: order
+  ports:
+    - port: 4004
+      targetPort: 4004

@@ -10,3 +10,10 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+
+# Terraform — never commit provider binaries or state. .terraform.lock.hcl
+# IS committed (pins provider versions, like a package-lock.json), so it's
+# deliberately not listed here.
+infra/terraform/.terraform/
+infra/terraform/*.tfstate
+infra/terraform/*.tfstate.backup

@@ -1,0 +1,65 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gateway
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gateway
+  template:
+    metadata:
+      labels:
+        app: gateway
+    spec:
+      containers:
+        - name: gateway
+          image: bigstan00/ecommerce-gateway:latest
+          ports:
+            - containerPort: 8080
+          envFrom:
+            - secretRef:
+                name: app-shared-secrets  # provides JWT_SECRET (and ADMIN_TOKEN, unused here — harmless)
+          env:
+            - { name: PORT, value: "8080" }
+            # In-cluster DNS names — every one of these Services already exists.
+            - { name: AUTH_SERVICE_URL, value: "http://auth:4001" }
+            - { name: CATALOG_SERVICE_URL, value: "http://catalog:4002" }
+            - { name: CART_SERVICE_URL, value: "http://cart:4003" }
+            - { name: ORDER_SERVICE_URL, value: "http://order:4004" }
+            - { name: INVENTORY_SERVICE_URL, value: "http://inventory:4006" }
+            - { name: LOG_LEVEL, value: "info" }
+            - { name: READINESS_TIMEOUT_MS, value: "2000" }
+            - { name: RATE_LIMIT_MAX, value: "300" }
+            - { name: RATE_LIMIT_WINDOW, value: "1 minute" }
+            - { name: RATE_LIMIT_AUTH_MAX, value: "10" }
+            - { name: RATE_LIMIT_AUTH_WINDOW, value: "1 minute" }
+            - { name: RATE_LIMIT_USER_MAX, value: "60" }
+            - { name: RATE_LIMIT_USER_WINDOW, value: "1 minute" }
+            # RATE_LIMIT_REDIS_URL deliberately left unset: correct for a
+            # single replica (in-memory counters). If this is ever scaled
+            # to replicas > 1, this MUST be set to the ElastiCache
+            # endpoint, or each replica counts independently and silently
+            # multiplies the effective rate limit by the replica count.
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://localhost:4318" }
+            - { name: OTEL_SERVICE_NAME, value: "gateway" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: gateway
+  namespace: ecommerce
+spec:
+  type: NodePort
+  selector:
+    app: gateway
+  ports:
+    - port: 8080
+      targetPort: 8080
+      # Pinned rather than left random. NodePort would otherwise pick any
+      # free port in 30000-32767 on its own, which would give us a
+      # different, unpredictable URL every time the Service is recreated —
+      # Frontend/Admin need this URL baked into their build ahead of time,
+      # so it has to be fixed and known in advance.
+      nodePort: 30080

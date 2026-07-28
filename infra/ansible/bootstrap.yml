@@ -1,0 +1,163 @@
+---
+# Phase 3: turns 3 bare Ubuntu boxes into machines that are READY for
+# kubeadm — not yet a cluster, just prerequisites installed and
+# configured correctly. Runs identically against every node (control
+# plane and workers need the exact same base setup); the control-plane-
+# vs-worker split only starts to matter in Phase 4 (kubeadm init/join).
+- name: Bootstrap Kubernetes prerequisites on every node
+  hosts: all
+  become: true
+  vars:
+    kubernetes_minor_version: "1.36"
+
+  tasks:
+    # --- Swap must be off. kubelet refuses to start with swap enabled,
+    # full stop — this trips up nearly everyone's first from-scratch
+    # kubeadm attempt. ---
+    - name: Disable swap for the current session
+      command: swapoff -a
+      changed_when: true
+
+    - name: Comment out any swap entries in /etc/fstab (so it stays off after reboot)
+      replace:
+        path: /etc/fstab
+        regexp: '^([^#\n]*\sswap\s+sw\s+.*)$'
+        replace: '# \1'
+
+    # --- Kernel modules containerd/Kubernetes networking depends on. ---
+    - name: Ensure required kernel modules load on boot
+      copy:
+        dest: /etc/modules-load.d/k8s.conf
+        content: |
+          overlay
+          br_netfilter
+        mode: "0644"
+
+    - name: Load the kernel modules now, not just on next boot
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+
+    # --- sysctl params kubeadm's own preflight checks require. ---
+    - name: Set required sysctl params for Kubernetes networking
+      copy:
+        dest: /etc/sysctl.d/k8s.conf
+        content: |
+          net.bridge.bridge-nf-call-iptables  = 1
+          net.bridge.bridge-nf-call-ip6tables = 1
+          net.ipv4.ip_forward                 = 1
+        mode: "0644"
+
+    # Deliberately NOT a handler here. A handler only fires when the task
+    # above reports "changed" AND the play reaches its end — on a re-run
+    # where the file's already correct (the common case), it reports "ok"
+    # and the handler is never even notified, silently leaving the config
+    # file correct on disk but never actually loaded into the running
+    # kernel. This exact gap is what caused kubeadm's preflight check to
+    # fail. Making it unconditional costs nothing (sysctl --system is
+    # cheap and safe to re-run) and removes the whole failure class.
+    - name: Apply sysctl settings to the running kernel
+      command: sysctl --system
+      changed_when: true
+
+    # --- Container runtime. Kubernetes stopped supporting Docker directly
+    # as a runtime years ago (dockershim removal) — containerd is the
+    # standard choice now. ---
+    - name: Install containerd and prerequisite packages
+      apt:
+        name:
+          - containerd
+          - ca-certificates
+          - curl
+          - gnupg
+        state: present
+        update_cache: true
+
+    - name: Ensure /etc/containerd directory exists
+      file:
+        path: /etc/containerd
+        state: directory
+        mode: "0755"
+
+    - name: Generate containerd's default config (only if it doesn't exist yet)
+      shell: containerd config default > /etc/containerd/config.toml
+      args:
+        creates: /etc/containerd/config.toml
+
+    # THE classic kubeadm gotcha: kubelet defaults to the systemd cgroup
+    # driver, but containerd's own default config sets SystemdCgroup =
+    # false. That mismatch doesn't error loudly — it just makes kubelet
+    # unstable/crashy in a way that's genuinely confusing to debug the
+    # first time you hit it. Fixing it here, before it ever bites.
+    - name: Fix containerd's cgroup driver to match kubelet's (systemd)
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: "^(\\s*)SystemdCgroup = false"
+        line: '\1SystemdCgroup = true'
+        backrefs: true
+      notify: Restart containerd
+
+    - name: Ensure containerd is enabled and running
+      systemd:
+        name: containerd
+        enabled: true
+        state: started
+
+    # --- Kubernetes's own apt repository. The old apt.kubernetes.io repo
+    # is deprecated; pkgs.k8s.io is the current official one, and it's
+    # versioned per minor release (v1.36 specifically), not "latest
+    # forever" — the version has to be picked deliberately. ---
+    - name: Ensure /etc/apt/keyrings exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: "0755"
+
+    - name: Add the Kubernetes apt signing key
+      shell: >
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_minor_version }}/deb/Release.key
+        | gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+
+    - name: Add the Kubernetes apt repository
+      copy:
+        dest: /etc/apt/sources.list.d/kubernetes.list
+        content: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_minor_version }}/deb/ /\n"
+        mode: "0644"
+
+    - name: Install kubelet, kubeadm, kubectl
+      apt:
+        name:
+          - kubelet
+          - kubeadm
+          - kubectl
+        state: present
+        update_cache: true
+
+    # Hold these packages so a routine `apt upgrade` can't silently pull
+    # in a different Kubernetes minor version mid-cluster-operation —
+    # Kubernetes upgrades are a deliberate, coordinated action you take
+    # on purpose, never an accidental side effect of unattended-upgrades.
+    - name: Pin kubelet/kubeadm/kubectl versions (prevent accidental upgrades)
+      dpkg_selections:
+        name: "{{ item }}"
+        selection: hold
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+    - name: Enable kubelet (it'll actually start successfully once kubeadm init/join runs)
+      systemd:
+        name: kubelet
+        enabled: true
+
+  handlers:
+    - name: Restart containerd
+      systemd:
+        name: containerd
+        state: restarted

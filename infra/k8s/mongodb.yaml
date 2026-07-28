@@ -1,0 +1,72 @@
+# StatefulSet, not Deployment: gives this pod a stable identity
+# (mongodb-0, always the same name) and a real EBS-backed disk that
+# follows it across restarts/rescheduling — a normal Deployment
+# guarantees neither. Credentials come from the `mongo-credentials`
+# Secret (created imperatively, never committed to git as plaintext)
+# via secretKeyRef below.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: mongodb
+  namespace: ecommerce
+spec:
+  serviceName: mongodb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mongodb
+  template:
+    metadata:
+      labels:
+        app: mongodb
+    spec:
+      containers:
+        - name: mongodb
+          image: mongo:7.0
+          ports:
+            - containerPort: 27017
+          env:
+            - name: MONGO_INITDB_ROOT_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: mongo-credentials
+                  key: MONGO_ROOT_USER
+            - name: MONGO_INITDB_ROOT_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: mongo-credentials
+                  key: MONGO_ROOT_PASSWORD
+          volumeMounts:
+            - name: mongo-data
+              mountPath: /data/db
+  # Replaces the old `volumes: emptyDir` block. Each replica (just
+  # mongodb-0 here) gets its own real PersistentVolumeClaim, created
+  # automatically from this template — an actual EBS disk provisioned
+  # via the ebs-gp3 StorageClass, not temporary node scratch space.
+  volumeClaimTemplates:
+    - metadata:
+        name: mongo-data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: ebs-gp3
+        resources:
+          requests:
+            storage: 5Gi
+---
+# clusterIP: None makes this a "headless" Service — required for a
+# StatefulSet to give its pod a stable DNS identity. Existing app code
+# that connects to `mongodb:27017` is unaffected: for a single replica,
+# that name still resolves, it just now returns the pod's real IP
+# directly instead of a virtual load-balanced one.
+apiVersion: v1
+kind: Service
+metadata:
+  name: mongodb
+  namespace: ecommerce
+spec:
+  clusterIP: None
+  selector:
+    app: mongodb
+  ports:
+    - port: 27017
+      targetPort: 27017

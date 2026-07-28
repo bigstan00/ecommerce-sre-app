@@ -1,0 +1,20 @@
+# Tells Kubernetes HOW to fulfill a PersistentVolumeClaim: which driver
+# to hand the request to (the EBS CSI driver we just installed) and what
+# kind of disk to create. Nothing provisions until something actually
+# asks for storage using this class by name.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ebs-gp3
+provisioner: ebs.csi.aws.com
+parameters:
+  type: gp3
+# EBS volumes live in a single Availability Zone and can only attach to
+# instances in that same AZ — our workers are deliberately spread across
+# two. WaitForFirstConsumer delays actually creating the disk until a
+# pod requesting it has been scheduled to a specific node, so the volume
+# gets created in that node's AZ. The alternative (Immediate) can create
+# a volume in the "wrong" AZ before Kubernetes even knows which node the
+# pod will land on, leaving the pod stuck Pending forever.
+volumeBindingMode: WaitForFirstConsumer
+allowVolumeExpansion: true

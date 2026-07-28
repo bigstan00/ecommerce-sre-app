@@ -1,0 +1,43 @@
+# Redis needs no secret here — no AUTH token by design (see
+# elasticache.tf's reasoning: network isolation via security group is
+# the real control). REDIS_URL is just a hostname, not sensitive, so a
+# plain literal value is fine — no need to route it through a Secret.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: cart
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: cart
+  template:
+    metadata:
+      labels:
+        app: cart
+    spec:
+      containers:
+        - name: cart
+          image: bigstan00/ecommerce-cart:latest
+          ports:
+            - containerPort: 4003
+          env:
+            - { name: PORT, value: "4003" }
+            - { name: REDIS_URL, value: "redis://k8s-learning-redis.f3gtjd.0001.eun1.cache.amazonaws.com:6379" }
+            - { name: CATALOG_SERVICE_URL, value: "http://catalog:4002" }
+            - { name: LOG_LEVEL, value: "info" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://localhost:4318" }
+            - { name: OTEL_SERVICE_NAME, value: "cart-service" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: cart
+  namespace: ecommerce
+spec:
+  selector:
+    app: cart
+  ports:
+    - port: 4003
+      targetPort: 4003

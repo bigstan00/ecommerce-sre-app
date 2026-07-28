@@ -1,0 +1,42 @@
+# No Service needed — this service has almost no HTTP surface (health/
+# metrics only per its .env.example); all the real work happens by
+# consuming Kafka, which it reaches via the `kafka` Service directly.
+# Still exposing the port for health checks/future use.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: notification
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: notification
+  template:
+    metadata:
+      labels:
+        app: notification
+    spec:
+      containers:
+        - name: notification
+          image: bigstan00/ecommerce-notification:latest
+          ports:
+            - containerPort: 4007
+          env:
+            - { name: PORT, value: "4007" }
+            - { name: KAFKA_BROKERS, value: "kafka:9092" }
+            - { name: LOG_LEVEL, value: "info" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://localhost:4318" }
+            - { name: OTEL_SERVICE_NAME, value: "notification-service" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: notification
+  namespace: ecommerce
+spec:
+  selector:
+    app: notification
+  ports:
+    - port: 4007
+      targetPort: 4007

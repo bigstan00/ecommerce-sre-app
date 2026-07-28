@@ -1,0 +1,42 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: catalog
+  namespace: ecommerce
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: catalog
+  template:
+    metadata:
+      labels:
+        app: catalog
+    spec:
+      containers:
+        - name: catalog
+          image: bigstan00/ecommerce-catalog:latest
+          ports:
+            - containerPort: 4002
+          envFrom:
+            - secretRef:
+                name: mongo-uri       # provides MONGO_URI
+            - secretRef:
+                name: app-shared-secrets  # provides ADMIN_TOKEN (and JWT_SECRET, unused here — harmless)
+          env:
+            - { name: PORT, value: "4002" }
+            - { name: MONGO_DB_NAME, value: "catalog" }
+            - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://localhost:4318" } # no collector deployed yet — logs a warning, never blocks startup
+            - { name: OTEL_SERVICE_NAME, value: "catalog-service" }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: catalog
+  namespace: ecommerce
+spec:
+  selector:
+    app: catalog
+  ports:
+    - port: 4002
+      targetPort: 4002
