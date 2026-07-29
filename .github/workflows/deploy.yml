@@ -78,9 +78,6 @@ jobs:
             admin) echo "context=admin" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-admin" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -94,11 +91,18 @@ jobs:
       # into the browser bundle at build time (Next.js inlines
       # NEXT_PUBLIC_* vars) — same requirement discovered the hard way
       # in Phase 9. Every other service gets no extra build args.
+      #
+      # No `platforms:` here, deliberately — this build runs on the
+      # runner pod itself, which lives on one of our own amd64 EC2
+      # nodes. Unlike the original by-hand builds (done on an Apple
+      # Silicon/arm64 Mac, needing multi-arch to reach an amd64
+      # cluster), this pipeline already runs on the target
+      # architecture natively — no QEMU emulation or multi-platform
+      # manifest complexity needed.
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: ${{ steps.vars.outputs.context }}
-          platforms: linux/amd64,linux/arm64
           push: true
           build-args: |
             ${{ (matrix.service == 'frontend' || matrix.service == 'admin') && 'NEXT_PUBLIC_API_URL=http://13.63.120.61:30080/api' || '' }}
