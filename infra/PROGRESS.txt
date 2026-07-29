@@ -872,13 +872,282 @@ the cluster required zero changes — they only ever knew these as
 kafka:9092 / mongodb:27017, and that DNS contract didn't change.
 
 
+PHASE 11 — INCIDENT: SILENT FULL CLUSTER LOSS FROM AMI DRIFT, AND THE REBUILD
+------------------------------------------------------------------------------------
+
+While starting CI/CD work, a routine `terraform apply` for the
+recurring allowed_admin_cidr IP update (see Phase 7/9/10 — the laptop's
+dynamic IP had changed again) had an unexpected side effect: it
+DESTROYED AND RECREATED ALL THREE EC2 INSTANCES, wiping the entire live
+cluster.
+
+DISCOVERY:
+
+kubectl started failing with "connection refused" (not the usual
+timeout pattern from an IP mismatch). A direct SSH attempt to the
+control plane returned "WARNING: REMOTE HOST IDENTIFICATION HAS
+CHANGED" — a different SSH host-key fingerprint than the one trusted
+since this cluster was first built. Confirmed directly via AWS rather
+than assumed:
+
+    aws ec2 describe-instances --filters "Name=tag:Role,Values=control-plane" \
+      --query 'Reservations[].Instances[].{ID:InstanceId,State:State.Name,LaunchTime:LaunchTime,PublicIp:PublicIpAddress}'
+
+showed the original control-plane instance terminated and a brand-new
+one launched minutes earlier, sitting behind the same Elastic IP. The
+same check against the workers showed identical behavior — ALL THREE
+NODES, not a partial hit.
+
+ROOT CAUSE:
+
+ec2.tf's data "aws_ami" "ubuntu" used most_recent = true — which
+re-resolves on EVERY SINGLE plan/apply, forever, not just at initial
+creation. Canonical shipped a new patched Ubuntu 22.04 image between
+this cluster's original build and this apply. AMI is one of the
+handful of aws_instance attributes Terraform cannot change in-place —
+so it silently destroyed and recreated all three nodes as an
+UNINTENDED SIDE EFFECT OF A COMPLETELY UNRELATED, ROUTINE CHANGE. This
+is a real, well-known Terraform footgun for any long-lived instance: a
+data source meant to avoid "hardcoding a value that'll rot" instead
+became a value that could change underneath a running system with zero
+warning.
+
+WHAT WAS ACTUALLY LOST VS. WHAT SURVIVED:
+
+LOST: the entire live Kubernetes cluster — every pod, Deployment,
+StatefulSet, Secret, and namespace that only existed in etcd on the
+now-terminated control-plane instance.
+
+SURVIVED, COMPLETELY UNTOUCHED — the actual value at risk:
+  - RDS (Postgres) and ElastiCache (Redis) — separate AWS services,
+    never touched by an EC2 instance replacement
+  - The 2 EBS volumes backing Kafka/MongoDB — orphaned (available, not
+    attached to anything) but NOT DELETED. Kubernetes' PV controller
+    never got the chance to process a deletion; the control plane just
+    vanished. Confirmed via `aws ec2 describe-volumes`.
+  - Every Docker image on Docker Hub, every file in this git repo
+    (Terraform, Ansible, all k8s manifests, both PROGRESS docs)
+
+FIX 1 — PIN THE AMI SO THIS CAN NEVER SILENTLY HAPPEN AGAIN:
+
+ec2.tf: renamed the data source to ubuntu_latest and stopped
+referencing it directly in either aws_instance block. Added
+variable "ami_id" (variables.tf), pinned to the exact AMI already
+running (ami-0742c3087b4157050 — verified via describe-instances, not
+guessed, so applying this change caused ZERO further replacement:
+confirmed 0 added, 0 changed, 0 destroyed). The ubuntu_latest data
+source stays, purely as an informational signal — outputs.tf gained
+ami_update_available (bool) and ami_latest_available_id, so a future
+upgrade is a deliberate, visible decision (bump var.ami_id yourself,
+expect every node to be replaced when you do) rather than something
+that happens invisibly inside an unrelated apply.
+
+FIX 2 — REBUILD THE CLUSTER ON THE NEW (ALREADY-PROVISIONED) INSTANCES:
+
+Every step below is a straight re-run of already-working, already-
+documented procedure from Phases 3-10 — nothing needed to be
+redesigned, only re-applied. This is itself worth noting: the whole
+cluster proved genuinely reproducible from code in under an hour,
+which is the actual point of doing all of this as
+Terraform/Ansible/k8s-manifests instead of by hand.
+
+1. Updated infra/ansible/inventory.ini with the 3 new IPs (fresh
+   terraform output; control plane's public IP stayed the same — it's
+   the Elastic IP — but its private IP changed, and both workers got
+   entirely new public+private IPs).
+2. Cleared stale SSH host-key entries, re-ran
+   `ansible-playbook bootstrap.yml` against the fresh (bare)
+   instances — clean run, failed=0 on all three.
+3. Fresh `kubeadm init` on the control plane (new private IP), joined
+   both workers with the new token.
+4. Restored laptop kubectl access: same public-IP/tls-server-name
+   kubeconfig patch as the original build, updated for the new private
+   IP.
+5. Reinstalled Calico (v3.32.1) — hit the same "ensure CRDs are
+   installed first" timing race as a fresh install always risks (the
+   Tigera operator needs a few seconds to register its CRDs before the
+   second manifest can apply); simple retry after a short wait fixed
+   it. All nodes flipped to Ready.
+6. Reinstalled the AWS EBS CSI driver (same command as Phase 10) — IAM
+   permissions were still attached (Terraform-managed, untouched by
+   this incident), came up clean immediately.
+7. Recreated the ecommerce namespace and EVERY Secret from scratch —
+   re-fetched the still-valid RDS master password from Secrets Manager
+   (unaffected by the incident) and rebuilt the same percent-encoded
+   connection strings; generated a NEW MongoDB root password (the old
+   one was unrecoverable — it only ever lived in the destroyed Secret,
+   by design, never written anywhere else) and new
+   JWT_SECRET/ADMIN_TOKEN. Verified each service's exact expected
+   secret keys directly against its manifest before creating anything,
+   rather than assuming the same shape from memory.
+8. Reapplied the StorageClass and every k8s manifest. All 12 pods
+   (kafka-0, mongodb-0, 7 backend services, gateway, frontend, admin)
+   came up Running within ~2 minutes.
+9. Re-verified the actual thing that mattered most — Gateway's
+   /readyz, exercising real cross-node traffic (Gateway landed on a
+   different node than several of its dependencies) — returned
+   {"status":"ready"}, confirming source_dest_check=false (already
+   baked into ec2.tf, no extra step needed) applied correctly to the
+   new instances automatically. Re-verified Storefront in an actual
+   browser too — loaded cleanly.
+10. Deleted the 2 orphaned EBS volumes. MongoDB's couldn't practically
+    be reattached — its data is inaccessible without the old,
+    unrecoverable password, and MongoDB won't apply a new one to a
+    disk that already has an initialized database on it. Reattaching
+    only Kafka's alone, with nothing of real value on it, wasn't worth
+    the asymmetry. Both were just accruing cost for nothing.
+
+CURRENT STATE: fully recovered — cluster, all 12 pods,
+Storefront/Admin/Gateway all externally reachable again on the same
+NodePort URLs as before (the ports are pinned in the manifests
+themselves, so they came back unchanged). The AMI-drift root cause is
+fixed at the source, not just patched around this one time.
+
+
+PHASE 12 — CI/CD: SELF-HOSTED GITHUB ACTIONS RUNNER, IN-CLUSTER
+-----------------------------------------------------------------------
+
+Goal: push code -> automatically build, push, and deploy, with zero
+manual docker build/kubectl commands. The interesting design
+constraint driving every choice below: GitHub's own hosted runners
+live on the open internet with constantly-changing IPs, completely
+unlike the single locked-down /32 this cluster's security group has
+allowed for its entire existence. Opening the API server to GitHub's
+broad, shared cloud IP ranges would have been a real, permanent
+widening of the attack surface — so the runner had to live INSIDE the
+cluster instead, reaching the API server over the internal network,
+never requiring any inbound exposure at all.
+
+COMPONENTS BUILT:
+
+1. GitHub PAT (fine-grained, ecommerce-sre-app only) — let the runner
+   self-register with the repo. Real friction here, worth recording:
+   fine-grained PATs failed repeatedly with "403: Resource not
+   accessible by personal access token" — the specific
+   "Administration: Read and write" permission is easy to miss among
+   dozens of toggles. Switched to a CLASSIC PAT (repo + workflow
+   scopes) instead — a single checkbox, much harder to get wrong. Real
+   trade-off, stated plainly: broader access than the fine-grained
+   token would have given, accepted here for reliability on a
+   single-person learning project.
+2. `ci` namespace + the PAT stored as a Kubernetes Secret — separate
+   from the ecommerce app namespace, same principle as everywhere else
+   in this project.
+3. Scoped RBAC (infra/k8s/ci-rbac.yaml) — a ci-deployer ServiceAccount
+   bound to a Role that can ONLY get/list/watch/patch/update
+   Deployments (plus read-only on Pods/ReplicaSets for rollout-status
+   checks) inside the ecommerce namespace. Deliberately not the
+   cluster-admin kubeconfig every manual command this whole project
+   has used — a compromised or misconfigured CI job can only ever
+   damage one namespace's Deployments, not the cluster.
+4. The runner itself (infra/k8s/ci-runner.yaml) — a Deployment with
+   two containers sharing one pod: GitHub's runner software
+   (myoung34/github-runner, which re-derives its own short-lived
+   registration token from the PAT on every start, unlike the raw
+   upstream runner image which needs that fetched manually and doesn't
+   survive a restart), plus a docker:24-dind sidecar purely for
+   builds — necessary because this cluster's nodes run containerd, not
+   Docker, so there's no host Docker socket to reuse. Runs
+   --privileged, a genuine trade-off documented directly in the file's
+   comments (larger blast radius than an unprivileged container;
+   Kaniko/rootless buildkit is the harder, more locked-down
+   alternative, not implemented here).
+5. Docker Hub secrets on the GitHub repo itself (DOCKERHUB_USERNAME,
+   DOCKERHUB_TOKEN) — separate from anything stored in the cluster.
+6. The workflow (.github/workflows/deploy.yml) — on push to master,
+   dorny/paths-filter detects which of the 10 services actually
+   changed; a matrix job builds+pushes only those (tagged with both
+   the git SHA and latest — SHA tags make every live deployment
+   traceable back to an exact commit), then `kubectl set image` +
+   `kubectl rollout status` rolls it out and confirms the rollout
+   actually succeeded before the job reports success.
+
+REAL BUGS HIT AND FIXED, IN THE ORDER THEY WERE FOUND:
+
+1. Fine-grained PAT permission gap (above) — 403 on the runner
+   registration endpoint. Isolated by calling GitHub's API directly
+   with curl rather than trusting the runner script's generic error,
+   which surfaced GitHub's real message. Fixed by switching to a
+   classic PAT.
+2. git push denied — local git credentials were authenticated as the
+   wrong GitHub account (dakwojs, no write access to this repo), and a
+   stale GITHUB_TOKEN environment variable was silently overriding the
+   correct one. Fixed: `unset GITHUB_TOKEN`, `gh auth switch --user
+   bigstan00`, `gh auth setup-git` (this last step mattered
+   specifically — switching gh's active account doesn't automatically
+   sync git's own credential store).
+3. Push to .github/workflows/ denied even after switching accounts —
+   GitHub requires the specific "workflow" OAuth scope to modify files
+   under that path, as a deliberate extra protection since workflow
+   files can execute code. Fixed: `gh auth refresh -h github.com -s
+   workflow`.
+4. docker/login-action failing with "Password required" — one of the
+   two Docker Hub repository secrets never actually got saved (only
+   DOCKERHUB_USERNAME was present, DOCKERHUB_TOKEN was missing
+   entirely). Caught by checking the GitHub UI directly rather than
+   assuming both had saved correctly.
+5. A real, significant red herring: buildx's push step failing with
+   "401 Unauthorized ... failed to fetch oauth token", even after
+   fixing #4. Initially misdiagnosed as a multi-platform/QEMU issue
+   (removed --platform linux/amd64,linux/arm64 — genuinely unnecessary
+   here anyway, since this pipeline runs natively on the same amd64
+   architecture as the cluster it deploys to, unlike the original
+   by-hand builds done on an Apple Silicon Mac) — the error persisted
+   identically on a single-platform build, disproving that theory.
+   PROPERLY ISOLATED BY TESTING OUTSIDE THE PIPELINE ENTIRELY: the
+   exact same Docker Hub username/token pushed successfully via plain
+   `docker push` from a normal local Docker install, proving the
+   credentials themselves were fine and pointing squarely at something
+   specific to buildx's separate builder-container model under
+   Docker-in-Docker.
+6. The actual root cause, found by that same isolation test done
+   properly: the first local test used the ACCOUNT PASSWORD, not the
+   access token — a genuine difference the user caught and flagged
+   before it derailed the diagnosis further. Re-tested with the actual
+   token: login succeeded, but push failed with "access token has
+   insufficient scopes" — the token had been created without
+   Read & Write permission. That single missing checkbox was the
+   entire root cause behind both #5's buildx failure and what would
+   have been every subsequent push failure regardless of buildx vs.
+   plain docker build. Fixed: regenerated the token with correct
+   permissions, verified with a real local push before touching
+   GitHub again. Also simplified the workflow to plain docker
+   build/docker push instead of buildx — not strictly required once
+   the token was fixed, but removes a whole class of
+   DinD-credential-forwarding complexity that added nothing here (no
+   multi-platform need), kept as the simpler, more directly-verified
+   path.
+
+LESSON WORTH KEEPING: two of these bugs (401/buildx, and the
+account-password-vs-token mixup) looked identical from the outside and
+would have been easy to conflate. The thing that actually cut through
+it was testing the EXACT credential in isolation, outside the full
+pipeline, rather than continuing to iterate on pipeline configuration
+against an unverified assumption about what was actually broken.
+
+VERIFIED END-TO-END, NOT JUST "GREEN CHECKMARK":
+
+A real code change (a comment in services/auth/src/index.ts) pushed to
+master -> pipeline auto-detected only auth changed -> built, tagged,
+and pushed bigstan00/ecommerce-auth:<git-sha> -> deployed to the
+cluster -> confirmed directly on the cluster itself:
+
+    auth-7f678dd86-2bcv9   1/1   Running   0   2m20s
+    Image: bigstan00/ecommerce-auth:d6366d3706b4417d5fece59fbe852881ac090f77
+
+The running pod's image tag matches the exact commit SHA that
+triggered the build — proof the whole chain is real, not just a
+pipeline reporting success without actually changing anything.
+
+
 NEXT STEPS (not yet done)
 ----------------------------
 
   1. Seed some product data into Catalog so the Storefront has
      something to actually display (currently empty, correctly).
-  2. CI/CD (GitHub Actions), observability stack (Prometheus/Grafana +
-     tracing backend), and hardening (RBAC, NetworkPolicies, resource
-     limits, HA control plane, private subnets + NAT, per-role security
-     groups, IRSA instead of node-wide IAM) — later phases, not started
-     yet.
+  2. Observability stack (Prometheus/Grafana + tracing backend), and
+     remaining hardening (RBAC beyond CI's own scoped role,
+     NetworkPolicies, resource limits, HA control plane, private
+     subnets + NAT, per-role security groups, IRSA instead of
+     node-wide IAM, Kaniko/rootless buildkit instead of privileged
+     DinD) — later phases, not started yet.
