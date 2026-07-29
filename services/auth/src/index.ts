@@ -1,5 +1,5 @@
 import './tracing';
-// CI/CD pipeline test #2 — harmless comment, no functional change.
+// CI/CD pipeline test #3 — harmless comment, no functional change.
 import { buildApp } from './app';
 import { config } from './config';
 import { logger } from './config/logger';

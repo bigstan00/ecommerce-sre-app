@@ -78,9 +78,6 @@ jobs:
             admin) echo "context=admin" >> "$GITHUB_OUTPUT"; echo "image=bigstan00/ecommerce-admin" >> "$GITHUB_OUTPUT" ;;
           esac
 
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@v3
-
       - name: Log in to Docker Hub
         uses: docker/login-action@v3
         with:
@@ -92,23 +89,27 @@ jobs:
       # NEXT_PUBLIC_* vars) — same requirement discovered the hard way
       # in Phase 9. Every other service gets no extra build args.
       #
-      # No `platforms:` here, deliberately — this build runs on the
-      # runner pod itself, which lives on one of our own amd64 EC2
-      # nodes. Unlike the original by-hand builds (done on an Apple
-      # Silicon/arm64 Mac, needing multi-arch to reach an amd64
-      # cluster), this pipeline already runs on the target
-      # architecture natively — no QEMU emulation or multi-platform
-      # manifest complexity needed.
+      # Plain `docker build`/`docker push`, deliberately not buildx —
+      # we don't need multi-platform output (this runs natively on the
+      # same amd64 architecture as the cluster it deploys to), and
+      # buildx's separate builder-container model hit a credential-
+      # forwarding issue specific to this Docker-in-Docker setup
+      # (isolated and confirmed: the exact same username/token pushes
+      # successfully via plain `docker push` from a normal Docker
+      # install — the credentials were never the problem). A plain
+      # build sidesteps that whole failure class.
       - name: Build and push
-        uses: docker/build-push-action@v6
-        with:
-          context: ${{ steps.vars.outputs.context }}
-          push: true
-          build-args: |
-            ${{ (matrix.service == 'frontend' || matrix.service == 'admin') && 'NEXT_PUBLIC_API_URL=http://13.63.120.61:30080/api' || '' }}
-          tags: |
-            ${{ steps.vars.outputs.image }}:${{ github.sha }}
-            ${{ steps.vars.outputs.image }}:latest
+        run: |
+          BUILD_ARGS=""
+          if [ "${{ matrix.service }}" = "frontend" ] || [ "${{ matrix.service }}" = "admin" ]; then
+            BUILD_ARGS="--build-arg NEXT_PUBLIC_API_URL=http://13.63.120.61:30080/api"
+          fi
+          docker build $BUILD_ARGS \
+            -t ${{ steps.vars.outputs.image }}:${{ github.sha }} \
+            -t ${{ steps.vars.outputs.image }}:latest \
+            ${{ steps.vars.outputs.context }}
+          docker push ${{ steps.vars.outputs.image }}:${{ github.sha }}
+          docker push ${{ steps.vars.outputs.image }}:latest
 
       - name: Set up kubectl
         uses: azure/setup-kubectl@v4
