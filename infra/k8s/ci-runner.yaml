@@ -28,7 +28,7 @@ metadata:
   name: ci-runner
   namespace: ci
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: ci-runner
@@ -59,6 +59,19 @@ spec:
                 secretKeyRef:
                   name: github-pat
                   key: PAT
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 256Mi
+              cpu: 500m
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
         - name: dind
           image: docker:24-dind
           securityContext:
@@ -73,3 +86,16 @@ spec:
           args:
             - "--host=tcp://0.0.0.0:2375"
             - "--host=unix:///var/run/docker.sock"
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 256Mi
+              cpu: 500m
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
