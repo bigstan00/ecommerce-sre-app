@@ -39,6 +39,19 @@ spec:
           volumeMounts:
             - name: mongo-data
               mountPath: /data/db
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 256Mi
+              cpu: 500m
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 27017
+            initialDelaySeconds: 5
+            periodSeconds: 10
   # Replaces the old `volumes: emptyDir` block. Each replica (just
   # mongodb-0 here) gets its own real PersistentVolumeClaim, created
   # automatically from this template — an actual EBS disk provisioned
@@ -47,11 +60,12 @@ spec:
     - metadata:
         name: mongo-data
       spec:
-        accessModes: ["ReadWriteOnce"]
+        accessModes: [ "ReadWriteOnce" ]
         storageClassName: ebs-gp3
         resources:
           requests:
             storage: 5Gi
+---
 ---
 # clusterIP: None makes this a "headless" Service — required for a
 # StatefulSet to give its pod a stable DNS identity. Existing app code
