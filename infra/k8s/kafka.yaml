@@ -37,7 +37,10 @@ spec:
             # must be the Service's in-cluster DNS name, not localhost,
             # or every other service's connection will fail even though
             # Kafka itself looks healthy.
-            - { name: KAFKA_ADVERTISED_LISTENERS, value: "PLAINTEXT://kafka.ecommerce.svc.cluster.local:9092" }
+            - {
+                name: KAFKA_ADVERTISED_LISTENERS,
+                value: "PLAINTEXT://kafka.ecommerce.svc.cluster.local:9092"
+              }
             - { name: KAFKA_CONTROLLER_LISTENER_NAMES, value: "CONTROLLER" }
             - { name: KAFKA_INTER_BROKER_LISTENER_NAME, value: "PLAINTEXT" }
             # These three all default to 3 (assuming a real multi-broker
@@ -49,6 +52,19 @@ spec:
           volumeMounts:
             - name: kafka-data
               mountPath: /var/lib/kafka/data
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 256Mi
+              cpu: 500m
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 9092
+            initialDelaySeconds: 5
+            periodSeconds: 10
   # Replaces the old `volumes: emptyDir` block. Each replica (just
   # kafka-0 here) gets its own real PersistentVolumeClaim, created
   # automatically from this template — an actual EBS disk provisioned
@@ -57,11 +73,12 @@ spec:
     - metadata:
         name: kafka-data
       spec:
-        accessModes: ["ReadWriteOnce"]
+        accessModes: [ "ReadWriteOnce" ]
         storageClassName: ebs-gp3
         resources:
           requests:
             storage: 5Gi
+---
 ---
 # clusterIP: None makes this a "headless" Service — required for a
 # StatefulSet to give its pod a stable DNS identity. Existing app code
