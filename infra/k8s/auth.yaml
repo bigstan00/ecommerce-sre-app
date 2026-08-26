@@ -4,7 +4,7 @@ metadata:
   name: auth
   namespace: ecommerce
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: auth
@@ -20,9 +20,9 @@ spec:
             - containerPort: 4001
           envFrom:
             - secretRef:
-                name: auth-db-url        # provides DATABASE_URL
+                name: auth-db-url # provides DATABASE_URL
             - secretRef:
-                name: app-shared-secrets  # provides JWT_SECRET (and ADMIN_TOKEN, unused here — harmless)
+                name: app-shared-secrets # provides JWT_SECRET (and ADMIN_TOKEN, unused here — harmless)
           env:
             - { name: PORT, value: "4001" }
             - { name: ACCESS_TOKEN_TTL, value: "15m" }
@@ -30,6 +30,20 @@ spec:
             - { name: LOG_LEVEL, value: "info" }
             - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://localhost:4318" }
             - { name: OTEL_SERVICE_NAME, value: "auth-service" }
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 256Mi
+              cpu: 500m
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4001
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
 ---
 apiVersion: v1
 kind: Service
