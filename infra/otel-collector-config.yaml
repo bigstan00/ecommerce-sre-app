@@ -1,0 +1,48 @@
+# aiobs: starter OpenTelemetry Collector config (created from scratch).
+#
+# Your services emit telemetry but no collector was configured to receive and
+# forward it. This receives OTLP from them and ships it to your backend.
+#
+# BEFORE USING: set the real backend endpoint + auth in the otlp/backend exporter
+# below (keep secrets in your secret store, not in this file). The <your-backend>
+# value is a placeholder aiobs cannot fill in.
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 80
+    spike_limit_percentage: 25
+  batch:
+    timeout: 5s
+
+exporters:
+  # TODO: point at your real observability backend and add its auth/headers.
+  otlp/backend:
+    endpoint: <your-backend>:4317
+    tls:
+      insecure: false
+  # A local view while you wire up the backend — remove in production.
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/backend, debug]
+    metrics:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/backend, debug]
+    logs:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [otlp/backend, debug]
