@@ -4,7 +4,7 @@ metadata:
   name: gateway
   namespace: ecommerce
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: gateway
@@ -20,7 +20,7 @@ spec:
             - containerPort: 8080
           envFrom:
             - secretRef:
-                name: app-shared-secrets  # provides JWT_SECRET (and ADMIN_TOKEN, unused here — harmless)
+                name: app-shared-secrets # provides JWT_SECRET (and ADMIN_TOKEN, unused here — harmless)
           env:
             - { name: PORT, value: "8080" }
             # In-cluster DNS names — every one of these Services already exists.
@@ -44,6 +44,20 @@ spec:
             # multiplies the effective rate limit by the replica count.
             - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://localhost:4318" }
             - { name: OTEL_SERVICE_NAME, value: "gateway" }
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 256Mi
+              cpu: 500m
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
 ---
 apiVersion: v1
 kind: Service
