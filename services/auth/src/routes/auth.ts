@@ -1,3 +1,10 @@
+// aiobs: business-event recorder (auto-added). Emits one structured JSON
+// line per event to stdout — ingested by any log pipeline. Swap the body
+// to forward to your telemetry SDK (e.g. OpenTelemetry) if you prefer.
+function track(event: string, attributes?: Record<string, unknown>): void {
+  try { console.log(JSON.stringify({ ts: new Date().toISOString(), event, ...(attributes ?? {}) })); } catch { /* never let telemetry throw */ }
+}
+
 import bcrypt from 'bcrypt';
 import type { FastifyInstance } from 'fastify';
 import { createUser, findUserByEmail, findUserById } from '../db/usersRepository';
@@ -145,6 +152,7 @@ export async function authRoutes(app: FastifyInstance): Promise<void> {
   app.post('/auth/logout', async (request, reply) => {
     const token = extractBearerTokenOrThrow(request.headers.authorization);
     const payload = verifyAccessTokenOrThrow(token);
+    track('auth.revoked', { userId: payload.sub });
 
     await revokeAllRefreshTokensForUser(payload.sub);
 
