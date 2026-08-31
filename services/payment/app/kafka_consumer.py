@@ -1,3 +1,13 @@
+# aiobs: business-event recorder (auto-added). Emits one structured JSON
+# line per event to stdout — ingested by any log pipeline. Swap the body
+# to forward to your telemetry SDK (e.g. OpenTelemetry) if you prefer.
+def track(event, attributes=None):
+    import json as _json, sys as _sys, datetime as _dt
+    try:
+        _sys.stdout.write(_json.dumps({"ts": _dt.datetime.utcnow().isoformat(), "event": event, **(attributes or {})}) + "\n")
+    except Exception:
+        pass  # never let telemetry throw
+
 """Background Kafka consumer for the Payment service.
 
 Consumer group `payment-service`, per CONTRACTS.md Kafka conventions.
@@ -121,6 +131,7 @@ async def _handle_order_created(envelope: dict) -> None:
         logger.warning("order_created_missing_fields", orderId=order_id)
         return
 
+track('order.amount.cached', {'order_id': order_id, 'amount': total_amount})
     await db.cache_order_amount(order_id, float(total_amount))
 
 
@@ -177,6 +188,7 @@ async def _handle_inventory_reserved(envelope: dict, trace_context: Context) -> 
             logger.info("payment_already_processed_skipping_post_delay", orderId=order_id)
             return
         PAYMENTS_PROCESSED_TOTAL.labels(outcome="failed").inc()
+        track('payment.failed', {'order_id': order_id, 'amount': amount, 'reason': PAYMENT_FAILURE_REASON})
         await publish_event(
             topic="payment.failed",
             event_type="payment.failed",
@@ -199,6 +211,7 @@ async def _handle_inventory_reserved(envelope: dict, trace_context: Context) -> 
             logger.info("payment_already_processed_skipping_post_delay", orderId=order_id)
             return
         PAYMENTS_PROCESSED_TOTAL.labels(outcome="completed").inc()
+        track('payment.completed', {'order_id': order_id, 'amount': amount})
         await publish_event(
             topic="payment.completed",
             event_type="payment.completed",
