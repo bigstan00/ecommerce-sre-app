@@ -4,7 +4,7 @@ metadata:
   name: order
   namespace: ecommerce
 spec:
-  replicas: 1
+  replicas: 2
   selector:
     matchLabels:
       app: order
@@ -20,15 +20,29 @@ spec:
             - containerPort: 4004
           envFrom:
             - secretRef:
-                name: order-db-url        # provides DATABASE_URL
+                name: order-db-url # provides DATABASE_URL
             - secretRef:
-                name: app-shared-secrets  # provides ADMIN_TOKEN (and JWT_SECRET, unused here — harmless)
+                name: app-shared-secrets # provides ADMIN_TOKEN (and JWT_SECRET, unused here — harmless)
           env:
             - { name: PORT, value: "4004" }
             - { name: KAFKA_BROKERS, value: "kafka:9092" }
             - { name: CART_SERVICE_URL, value: "http://cart:4003" }
             - { name: OTEL_EXPORTER_OTLP_ENDPOINT, value: "http://localhost:4318" }
             - { name: OTEL_SERVICE_NAME, value: "order-service" }
+          resources:
+            requests:
+              memory: 128Mi
+              cpu: 100m
+            limits:
+              memory: 256Mi
+              cpu: 500m
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 4004
+            initialDelaySeconds: 5
+            periodSeconds: 10
+---
 ---
 apiVersion: v1
 kind: Service
